@@ -193,8 +193,8 @@ def get_shorter_translations(
     Returns:
         Empty list (stub).  Implement to return ``TranslationCandidate`` items.
     """
-    SPANISH_CHARS_PER_SECOND = 15.0
-    target_chars = int(target_duration_s * SPANISH_CHARS_PER_SECOND)
+    CHARS_PER_SECOND = 15.0
+    target_chars = int(target_duration_s * CHARS_PER_SECOND)
     candidates = []
 
     try:
