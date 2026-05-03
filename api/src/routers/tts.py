@@ -68,6 +68,10 @@ async def tts_endpoint(
             speaker_wav_map["__default__"] = speaker_wav
         else:
             speaker_wav_map["__default__"] = resolve_speaker_wav(settings.speakers_dir, lang)
+            segments = data.get("segments", [])
+            speakers = sorted(set(s["speaker"] for s in segments if "speaker" in s))
+            for speaker in speakers:
+                speaker_wav_map[speaker] = resolve_speaker_wav(settings.speakers_dir, lang, speaker)
 
     await _run_in_threadpool(
         None, svc.text_file_to_speech, str(source_path), str(audio_dir), alignment=alignment, speaker_wav_map=speaker_wav_map
