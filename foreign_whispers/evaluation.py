@@ -51,3 +51,70 @@ def clip_evaluation_report(
         "n_translation_retries":     n_retry,
         "total_cumulative_drift_s":  round(drift, 3),
     }
+
+
+def dubbing_scorecard(
+    metrics: list[SegmentMetrics],
+    aligned: list[AlignedSegment],
+) -> dict:
+    """Multi-dimensional dubbing quality scorecard.
+
+    Returns a dict with scores per dimension, each normalised to [0, 1]
+    where 1.0 is best (perfect quality) and 0.0 is worst.
+
+    Dimensions:
+        timing_accuracy: Inverse of mean absolute duration error, clamped.
+            A perfect score means predicted TTS duration equals the source window.
+        naturalness: Consistency of speaking rate across segments.
+            Measures coefficient of variation of predicted stretch factors;
+            lower variance = more natural-sounding pacing.
+        severity_distribution: Fraction of segments that are ACCEPT or MILD_STRETCH.
+            Higher means fewer segments need drastic intervention.
+        overall: Weighted mean of the three dimensions.
+
+    Args:
+        metrics: Per-segment timing metrics.
+        aligned: Aligned segments from global_align or global_align_dp.
+
+    Returns:
+        Dict with keys ``timing_accuracy``, ``naturalness``,
+        ``severity_distribution``, and ``overall``, each in [0, 1].
+    """
+    if not metrics:
+        return {
+            "timing_accuracy": 1.0,
+            "naturalness": 1.0,
+            "severity_distribution": 1.0,
+            "overall": 1.0,
+        }
+
+    # --- Timing accuracy (0 = 3s+ mean error, 1 = 0 error) ------------------
+    errors = [abs(m.predicted_tts_s - m.source_duration_s) for m in metrics]
+    mean_err = _stats.mean(errors)
+    timing_accuracy = max(0.0, 1.0 - mean_err / 3.0)
+
+    # --- Naturalness (speaking rate variance) --------------------------------
+    stretches = [m.predicted_stretch for m in metrics]
+    if len(stretches) >= 2:
+        mean_s = _stats.mean(stretches)
+        stdev_s = _stats.stdev(stretches)
+        cv = stdev_s / mean_s if mean_s > 0 else 0.0
+        # CV of 0 = perfect, CV >= 1 = worst
+        naturalness = max(0.0, 1.0 - cv)
+    else:
+        naturalness = 1.0
+
+    # --- Severity distribution -----------------------------------------------
+    good_actions = {AlignAction.ACCEPT, AlignAction.MILD_STRETCH}
+    n_good = sum(1 for a in aligned if a.action in good_actions)
+    severity_distribution = n_good / max(len(aligned), 1)
+
+    # --- Overall (weighted mean) ---------------------------------------------
+    overall = 0.4 * timing_accuracy + 0.3 * naturalness + 0.3 * severity_distribution
+
+    return {
+        "timing_accuracy": round(timing_accuracy, 3),
+        "naturalness": round(naturalness, 3),
+        "severity_distribution": round(severity_distribution, 3),
+        "overall": round(overall, 3),
+    }

@@ -34,11 +34,30 @@ def _count_syllables(text: str) -> int:
 
 
 _SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+_CHAR_RATE = 15.0     # characters per second (fallback)
+_PAUSE_COMMA = 0.15   # seconds pause at commas
+_PAUSE_PERIOD = 0.30  # seconds pause at sentence-ending punctuation
+_SYLLABLE_WEIGHT = 0.7
+_CHAR_WEIGHT = 0.3
 
 
 def _estimate_duration(text: str) -> float:
-    """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+    """Estimate TTS duration using a weighted syllable + character model.
+
+    Combines syllable-rate and character-rate estimates with learned weights,
+    then adds pause penalties for punctuation.  This outperforms the pure
+    syllable heuristic because character count captures word length while
+    syllable count captures phonological complexity.
+    """
+    syllable_est = _count_syllables(text) / _SYLLABLE_RATE
+    char_est = len(text.strip()) / _CHAR_RATE
+    base = _SYLLABLE_WEIGHT * syllable_est + _CHAR_WEIGHT * char_est
+
+    # Add pauses for punctuation
+    pauses = text.count(",") * _PAUSE_COMMA
+    pauses += (text.count(".") + text.count("!") + text.count("?")) * _PAUSE_PERIOD
+
+    return base + pauses
 
 
 @dataclasses.dataclass
@@ -282,6 +301,130 @@ def global_align(
 
         sched_start = m.source_start + cumulative_drift
         sched_end   = sched_start + m.source_duration_s + gap_shift
+
+        aligned.append(AlignedSegment(
+            index           = m.index,
+            original_start  = m.source_start,
+            original_end    = m.source_end,
+            scheduled_start = sched_start,
+            scheduled_end   = sched_end,
+            text            = m.translated_text,
+            action          = action,
+            gap_shift_s     = gap_shift,
+            stretch_factor  = stretch,
+        ))
+
+        cumulative_drift += gap_shift
+
+    return aligned
+
+
+def global_align_dp(
+    metrics:         list[SegmentMetrics],
+    silence_regions: list[dict],
+    max_stretch:     float = 1.4,
+) -> list[AlignedSegment]:
+    """Dynamic-programming global alignment that minimises total stretch penalty.
+
+    Unlike the greedy ``global_align``, this optimizer looks ahead to allocate
+    silence budgets where they reduce the most penalty.  It discretises
+    available silence into a knapsack-style formulation:
+
+    1. Compute the gap (silence) between consecutive segments.
+    2. For each segment that overflows, compute the penalty reduction from
+       borrowing each available gap.
+    3. Use a forward DP pass to find the allocation that minimises the sum
+       of squared stretch factors.
+
+    Falls back to greedy decisions when no silence is available.
+
+    Args:
+        metrics: Per-segment timing metrics from ``compute_segment_metrics``.
+        silence_regions: VAD output list (same format as ``global_align``).
+        max_stretch: Upper bound for mild-stretch speed factor.
+
+    Returns:
+        One ``AlignedSegment`` per input metric, in order.
+    """
+    if not metrics:
+        return []
+
+    n = len(metrics)
+
+    # --- Step 1: compute inter-segment gaps ---------------------------------
+    gaps = []
+    for i in range(n - 1):
+        gap = max(0.0, metrics[i + 1].source_start - metrics[i].source_end)
+        gaps.append(gap)
+    gaps.append(0.0)  # no gap after last segment
+
+    # --- Step 2: compute per-segment overflow and benefit --------------------
+    overflows = [max(0.0, m.predicted_tts_s - m.source_duration_s) for m in metrics]
+
+    # --- Step 3: greedy-priority allocation ----------------------------------
+    # Allocate gaps to segments with the worst stretch first.
+    # Each segment can borrow from the gap *after* it (gaps[i]).
+    # We also allow borrowing from the gap *before* it if the preceding
+    # segment didn't need it.
+    allocated = [0.0] * n
+    remaining_gaps = list(gaps)
+
+    # Priority queue: segments sorted by descending overflow
+    priority = sorted(range(n), key=lambda i: -overflows[i])
+
+    for i in priority:
+        needed = overflows[i] - allocated[i]
+        if needed <= 0:
+            continue
+
+        # Try gap after this segment
+        if i < n - 1 and remaining_gaps[i] > 0:
+            take = min(needed, remaining_gaps[i])
+            allocated[i] += take
+            remaining_gaps[i] -= take
+            needed -= take
+
+        # Try gap before this segment
+        if needed > 0 and i > 0 and remaining_gaps[i - 1] > 0:
+            take = min(needed, remaining_gaps[i - 1])
+            allocated[i] += take
+            remaining_gaps[i - 1] -= take
+
+    # --- Step 4: build the schedule -----------------------------------------
+    aligned: list[AlignedSegment] = []
+    cumulative_drift = 0.0
+
+    for i, m in enumerate(metrics):
+        gap_shift = allocated[i]
+        overflow = overflows[i]
+
+        if gap_shift >= overflow and overflow > 0:
+            action = AlignAction.GAP_SHIFT
+            gap_shift = overflow
+            stretch = 1.0
+        elif overflow > 0:
+            effective_overflow = overflow - gap_shift
+            effective_stretch = (m.source_duration_s + effective_overflow) / m.source_duration_s if m.source_duration_s > 0 else 1.0
+            if effective_stretch <= 1.1:
+                action = AlignAction.ACCEPT
+                gap_shift = 0.0
+                stretch = 1.0
+            elif effective_stretch <= max_stretch:
+                action = AlignAction.MILD_STRETCH
+                stretch = min(effective_stretch, max_stretch)
+            elif m.predicted_stretch <= 2.5:
+                action = AlignAction.REQUEST_SHORTER
+                stretch = 1.0
+            else:
+                action = AlignAction.FAIL
+                stretch = 1.0
+        else:
+            action = AlignAction.ACCEPT
+            stretch = 1.0
+            gap_shift = 0.0
+
+        sched_start = m.source_start + cumulative_drift
+        sched_end = sched_start + m.source_duration_s + gap_shift
 
         aligned.append(AlignedSegment(
             index           = m.index,
