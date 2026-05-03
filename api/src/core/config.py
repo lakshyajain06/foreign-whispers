@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     def dubbed_captions_dir(self) -> Path:
         return self.data_dir / "dubbed_captions"
 
+    @property
+    def speakers_dir(self) -> Path:
+        """Directory containing target-language speaker reference audio."""
+        return self.data_dir.parent / "speakers"
+
     # S3 storage
     s3_bucket: str = ""
     s3_endpoint_url: str = ""
