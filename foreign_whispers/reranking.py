@@ -8,6 +8,10 @@ SegmentMetrics.  The translation re-ranking function is a **student assignment**
 import dataclasses
 import logging
 
+import json
+import os
+from groq import Groq
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,6 +100,38 @@ def analyze_failures(report: dict) -> FailureAnalysis:
     )
 
 
+def llm_shorten(
+    source_text: str,
+    baseline_es: str,
+    target_chars: int,
+    context_prev: str,
+    context_next: str,
+) -> list[str]:
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+    context_block = ""
+    if context_prev:
+        context_block += f"Previous segment: {context_prev}\n"
+    if context_next:
+        context_block += f"Next segment: {context_next}\n"
+
+    prompt = f"""You are a professional Spanish dubbing translator. Shorten the Spanish translation to fit within {target_chars} characters while preserving meaning.
+    Original English: {source_text}
+    Baseline Spanish: {baseline_es}
+    {context_block}
+    Return ONLY a JSON array of 3 shortened Spanish candidates, shortest first. No explanation, no markdown, just the raw JSON array.
+    Example: ["short version 1", "short version 2", "short version 3"]"""
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=256,
+        temperature=0.3,  # l1ow temp for consistency
+    )
+
+    raw = response.choices[0].message.content.strip()
+    return [c for c in json.loads(raw) if isinstance(c, str)]
+
 def get_shorter_translations(
     source_text: str,
     baseline_es: str,
@@ -157,10 +193,28 @@ def get_shorter_translations(
     Returns:
         Empty list (stub).  Implement to return ``TranslationCandidate`` items.
     """
+    SPANISH_CHARS_PER_SECOND = 15.0
+    target_chars = int(target_duration_s * SPANISH_CHARS_PER_SECOND)
+    candidates = []
+
+    try:
+        llm_texts = llm_shorten(
+            source_text, baseline_es, target_chars, context_prev, context_next
+        )
+        for text in llm_texts:
+            candidates.append(TranslationCandidate(
+                text=text,
+                char_count=len(text),
+                brevity_rationale="LLM condensed alternative",
+            ))
+    except Exception as e:
+        logger.warning("LLM shortening failed: %s", e)
+
+    candidates.sort(key=lambda c: c.char_count)
     logger.info(
-        "get_shorter_translations called for %.1fs budget (%d chars baseline) — "
-        "returning empty list (student assignment stub).",
+        "get_shorter_translations: %.1fs budget (%d target chars), returning %d candidates.",
         target_duration_s,
-        len(baseline_es),
+        target_chars,
+        len(candidates),
     )
-    return []
+    return candidates
