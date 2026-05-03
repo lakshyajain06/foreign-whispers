@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     @property
     def transcriptions_dir(self) -> Path:
         return self.data_dir / "transcriptions" / self.stt_model_dir
+    
+    @property
+    def diarizations_dir(self) -> Path:
+        return self.data_dir / "diarizations"
 
     @property
     def translations_dir(self) -> Path:
