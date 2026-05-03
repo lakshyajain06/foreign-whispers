@@ -55,10 +55,22 @@ async def tts_endpoint(
             "config": config,
         }
 
-    source_path = str(trans_dir / f"{title}.json")
+    source_path = trans_dir / f"{title}.json"
+
+    speaker_wav_map: dict[str, str] = {}
+    if source_path.exists():
+        data = json.loads(source_path.read_text())
+        segments = data.get("segments", [])
+        lang = data.get("language", "es")
+        speakers = sorted(set(s["speaker"] for s in segments if "speaker" in s))
+        speakers_dir = settings.data_dir / "speakers" / lang
+        voice_files = sorted(speakers_dir.glob("*.wav")) if speakers_dir.exists() else []
+        for i, speaker in enumerate(speakers):
+            if i < len(voice_files):
+                speaker_wav_map[speaker] = str(voice_files[i])
 
     await _run_in_threadpool(
-        None, svc.text_file_to_speech, source_path, str(audio_dir), alignment=alignment
+        None, svc.text_file_to_speech, str(source_path), str(audio_dir), alignment=alignment, speaker_wav_map=speaker_wav_map
     )
 
     return {
