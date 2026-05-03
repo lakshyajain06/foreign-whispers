@@ -65,7 +65,7 @@ services:
     network_mode: host
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      - CHATTERBOX_API_URL=http://localhost:8020
+      - CHATTERB  OX_API_URL=http://localhost:8020
       - FW_WHISPER_MODEL=base
     volumes:
       - ./pipeline_data:/app/pipeline_data
