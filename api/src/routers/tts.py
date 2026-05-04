@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from api.src.core.config import settings
 from api.src.core.dependencies import resolve_title
 from api.src.services.tts_service import TTSService
+from foreign_whispers.voice_resolution import resolve_speaker_wav
 
 router = APIRouter(prefix="/api")
 
@@ -27,6 +28,7 @@ async def tts_endpoint(
     request: Request,
     config: str = Query(..., pattern=r"^c-[0-9a-f]{7}$"),
     alignment: bool = Query(False),
+    speaker_wav: str | None = Query(None, description="Reference voice WAV path (e.g. 'es/default.wav')"),
 ):
     """Generate TTS audio for a translated transcript.
 
@@ -62,12 +64,18 @@ async def tts_endpoint(
         data = json.loads(source_path.read_text())
         segments = data.get("segments", [])
         lang = data.get("language", "es")
-        speakers = sorted(set(s["speaker"] for s in segments if "speaker" in s))
-        speakers_dir = settings.data_dir / "speakers" / lang
-        voice_files = sorted(speakers_dir.glob("*.wav")) if speakers_dir.exists() else []
-        for i, speaker in enumerate(speakers):
-            if i < len(voice_files):
-                speaker_wav_map[speaker] = str(voice_files[i])
+        
+        unique_speakers = sorted(set(s.get("speaker", "SPEAKER_00") for s in segments))
+        if not unique_speakers:
+            unique_speakers = ["SPEAKER_00"]
+            
+        if speaker_wav is None:
+            speaker_wav_map = {
+                spk: resolve_speaker_wav(settings.speakers_dir, lang, spk)
+                for spk in unique_speakers
+            }
+        else:
+            speaker_wav_map = {spk: speaker_wav for spk in unique_speakers}
 
     await _run_in_threadpool(
         None, svc.text_file_to_speech, str(source_path), str(audio_dir), alignment=alignment, speaker_wav_map=speaker_wav_map
