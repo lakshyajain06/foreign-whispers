@@ -18,27 +18,37 @@ import re
 import unicodedata
 from enum import Enum
 
+import pyphen # syllabbifier lib
 
 def _count_syllables(text: str) -> int:
-    """Count syllables in target-language text via vowel-cluster counting.
+    """Count syllables in target-language text using Pyphen.
 
-    Designed for Romance languages (Spanish, French, Italian, Portuguese).
-    Strips accents then counts contiguous vowel runs. Each run = one syllable.
-    Returns at least 1 for any non-empty text so the rate never divides by zero.
+    Designed for Spanish (lang='es'). Returns at least 1 for any non-empty text.
     """
-    # Normalise: decompose accented chars, keep only ASCII letters + spaces
-    nfkd = unicodedata.normalize("NFKD", text.lower())
-    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
-    clusters = re.findall(r"[aeiou]+", ascii_text)
-    return max(1, len(clusters))
+    if not text.strip():
+        return 0
+    dic = pyphen.Pyphen(lang='es')
+    count = 0
+    for word in text.split():
+        # Pyphen returns 'word-with-hy-phens'
+        hyphenated = dic.inserted(word)
+        count += len(hyphenated.split('-'))
+    return max(1, count)
 
 
-_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+# Linear regression constants (seconds = syllables * slope + overhead)
+# Updated from regression results in alignment_integration.ipynb
+_SYLLABLE_SLOPE = 0.0897  # Seconds per syllable
+_TTS_OVERHEAD = 0.7168    # Fixed silence/buffer intercept
 
 
 def _estimate_duration(text: str) -> float:
     """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+    syllables = _count_syllables(text)
+    if syllables == 0:
+        return 0.0
+    
+    return (syllables * _SYLLABLE_SLOPE) + _TTS_OVERHEAD
 
 
 @dataclasses.dataclass
@@ -279,6 +289,159 @@ def global_align(
         elif action == AlignAction.MILD_STRETCH:
             stretch = min(m.predicted_stretch, max_stretch)
         # ACCEPT, REQUEST_SHORTER, FAIL → stretch stays at 1.0
+
+        sched_start = m.source_start + cumulative_drift
+        sched_end   = sched_start + m.source_duration_s + gap_shift
+
+        aligned.append(AlignedSegment(
+            index           = m.index,
+            original_start  = m.source_start,
+            original_end    = m.source_end,
+            scheduled_start = sched_start,
+            scheduled_end   = sched_end,
+            text            = m.translated_text,
+            action          = action,
+            gap_shift_s     = gap_shift,
+            stretch_factor  = stretch,
+        ))
+
+        cumulative_drift += gap_shift
+
+    return aligned
+
+
+def global_align_dp(
+    metrics:         list[SegmentMetrics],
+    silence_regions: list[dict],
+    max_stretch:     float = 1.4,
+) -> list[AlignedSegment]:
+    """Priority-based global alignment optimizer (beats the greedy baseline).
+
+    Improvements over greedy ``global_align``:
+
+    1. **Natural gap detection** — computes inter-segment gaps directly from
+       Whisper timestamps, so it works even without explicit VAD silence
+       regions.
+    2. **Priority-based allocation** — instead of greedily assigning each gap
+       to the segment immediately before it, this optimizer identifies all
+       segments that need gap time, ranks them by overflow severity, and
+       allocates available gap time to the neediest segments first.
+    3. **Lookahead** — a segment with mild overflow won't consume a gap that
+       a later segment with severe overflow could use more effectively.
+
+    Algorithm:
+
+    1. Compute available gap after each segment (max of VAD and natural gap).
+    2. Identify segments that would benefit from gap_shift (overflow > 0).
+    3. Sort candidate segments by overflow (descending — worst first).
+    4. Greedily assign gap time from the candidate's nearest gap, consuming
+       gaps in order of need severity.
+    5. Build the final schedule with cumulative drift from assigned shifts.
+
+    Args:
+        metrics: Per-segment timing metrics from ``compute_segment_metrics``.
+        silence_regions: VAD output — list of ``{"start_s", "end_s", "label"}``
+            dicts.  Pass ``[]`` if VAD is unavailable.
+        max_stretch: Upper bound for ``MILD_STRETCH`` speed factor.
+
+    Returns:
+        One ``AlignedSegment`` per input metric, in order.
+    """
+    if not metrics:
+        return []
+
+    n = len(metrics)
+
+    # --- Step 1: compute available gap after each segment ----------------
+    def _silence_after_vad(end_s: float) -> float:
+        for r in silence_regions:
+            if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
+                return r["end_s"] - r["start_s"]
+        return 0.0
+
+    def _natural_gap(i: int) -> float:
+        """Time between segment i's end and segment i+1's start."""
+        if i >= n - 1:
+            return 0.0
+        return max(0.0, metrics[i + 1].source_start - metrics[i].source_end)
+
+    # Each segment position has a gap capacity = max(VAD gap, natural gap)
+    gap_capacity = [max(_silence_after_vad(metrics[i].source_end),
+                        _natural_gap(i))
+                    for i in range(n)]
+    gap_remaining = list(gap_capacity)  # mutable copy
+
+    # --- Step 2: initial action for every segment (no gap available) -----
+    actions: list[AlignAction] = []
+    for m in metrics:
+        actions.append(decide_action(m, available_gap_s=0.0))
+
+    # --- Step 3: find segments that could benefit from gap time ----------
+    # Candidate = (overflow, segment_index)
+    candidates = []
+    for m in metrics:
+        if m.overflow_s > 0.01:  # needs gap time
+            candidates.append((m.overflow_s, m.index))
+
+    # Sort by overflow descending — worst overflow gets first pick
+    candidates.sort(key=lambda x: -x[0])
+
+    # --- Step 4: allocate gaps by priority -------------------------------
+    gap_assignments: dict[int, float] = {}  # seg_index → gap_shift amount
+
+    for overflow, idx in candidates:
+        m = metrics[idx]
+        # Try the gap right after this segment first
+        if gap_remaining[idx] >= overflow:
+            gap_assignments[idx] = overflow
+            gap_remaining[idx] -= overflow
+            actions[idx] = AlignAction.GAP_SHIFT
+            continue
+
+        # Try adjacent gaps (look one segment before and after)
+        best_gap_idx = None
+        best_gap_val = 0.0
+
+        for g in range(max(0, idx - 1), min(n, idx + 2)):
+            if gap_remaining[g] >= overflow and gap_remaining[g] > best_gap_val:
+                best_gap_idx = g
+                best_gap_val = gap_remaining[g]
+
+        if best_gap_idx is not None:
+            gap_assignments[idx] = overflow
+            gap_remaining[best_gap_idx] -= overflow
+            actions[idx] = AlignAction.GAP_SHIFT
+            continue
+
+        # Partial allocation: use whatever gap is available at this position
+        available = gap_remaining[idx]
+        if available > 0.01:
+            # Partial gap_shift — reduces overflow but may not fully fix it
+            reduced_overflow = overflow - available
+            gap_assignments[idx] = available
+            gap_remaining[idx] = 0.0
+            # Re-evaluate action with reduced overflow
+            sf_reduced = (m.predicted_tts_s - available) / m.source_duration_s \
+                if m.source_duration_s > 0 else m.predicted_stretch
+            if sf_reduced <= 1.1:
+                actions[idx] = AlignAction.ACCEPT
+            elif sf_reduced <= 1.4:
+                actions[idx] = AlignAction.MILD_STRETCH
+            else:
+                actions[idx] = AlignAction.GAP_SHIFT
+
+    # --- Step 5: build the schedule with cumulative drift ----------------
+    aligned: list[AlignedSegment] = []
+    cumulative_drift = 0.0
+
+    for i, m in enumerate(metrics):
+        action    = actions[i]
+        gap_shift = gap_assignments.get(i, 0.0)
+        stretch   = 1.0
+
+        if action == AlignAction.MILD_STRETCH:
+            stretch = min(m.predicted_stretch, max_stretch)
+        # For GAP_SHIFT, gap_shift is already set from assignments
 
         sched_start = m.source_start + cumulative_drift
         sched_end   = sched_start + m.source_duration_s + gap_shift

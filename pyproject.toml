@@ -27,6 +27,8 @@ dependencies = [
     "pyyaml>=6.0.3",
     "logfire",
     "groq>=1.2.0",
+    "silabeador>=1.2.2.post1",
+    "pyphen>=0.17.2",
 ]
 
 [dependency-groups]
