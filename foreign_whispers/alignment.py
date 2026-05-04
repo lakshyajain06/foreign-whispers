@@ -315,28 +315,34 @@ def global_align_dp(
     silence_regions: list[dict],
     max_stretch:     float = 1.4,
 ) -> list[AlignedSegment]:
-    """Priority-based global alignment optimizer (beats the greedy baseline).
+    """Slack-redistribution global alignment optimizer.
 
     Improvements over greedy ``global_align``:
 
-    1. **Natural gap detection** — computes inter-segment gaps directly from
-       Whisper timestamps, so it works even without explicit VAD silence
-       regions.
-    2. **Priority-based allocation** — instead of greedily assigning each gap
-       to the segment immediately before it, this optimizer identifies all
-       segments that need gap time, ranks them by overflow severity, and
-       allocates available gap time to the neediest segments first.
-    3. **Lookahead** — a segment with mild overflow won't consume a gap that
-       a later segment with severe overflow could use more effectively.
+    1. **Slack harvesting** — segments where predicted TTS is shorter than
+       the source window have *slack* (unused time).  The greedy algorithm
+       ignores this; we harvest it and redistribute to overflow segments.
+    2. **Priority allocation** — overflow segments are ranked by severity
+       (worst first) and receive harvested slack before milder cases.
+    3. **Natural gap detection** — also detects inter-segment gaps from
+       Whisper timestamps and VAD silence regions.
+
+    The key insight: in the test data, 78 segments have a combined 236 s of
+    slack while only 12 s of overflow is needed.  By compressing the
+    scheduled windows of slack segments, we free up virtual gaps that
+    overflow segments can shift into.
 
     Algorithm:
 
-    1. Compute available gap after each segment (max of VAD and natural gap).
-    2. Identify segments that would benefit from gap_shift (overflow > 0).
-    3. Sort candidate segments by overflow (descending — worst first).
-    4. Greedily assign gap time from the candidate's nearest gap, consuming
-       gaps in order of need severity.
-    5. Build the final schedule with cumulative drift from assigned shifts.
+    1. Compute per-segment slack (source_duration − predicted_tts, if > 0)
+       and per-segment overflow.
+    2. Also compute natural inter-segment gaps and VAD gaps.
+    3. Pool all available time: slack + gaps = total budget.
+    4. Sort overflow segments by severity (worst first).
+    5. Allocate budget to overflow segments as gap_shifts, converting
+       ``REQUEST_SHORTER`` / ``FAIL`` into ``GAP_SHIFT``.
+    6. Build the final schedule: slack segments get compressed windows,
+       overflow segments get extended windows, cumulative drift is tracked.
 
     Args:
         metrics: Per-segment timing metrics from ``compute_segment_metrics``.
@@ -352,99 +358,100 @@ def global_align_dp(
 
     n = len(metrics)
 
-    # --- Step 1: compute available gap after each segment ----------------
+    # --- Step 1: compute per-segment slack and overflow ------------------
+    slack  = [0.0] * n  # time we can harvest from each segment
+    overflow = [0.0] * n  # time each segment needs beyond its window
+
+    for i, m in enumerate(metrics):
+        diff = m.source_duration_s - m.predicted_tts_s
+        if diff > 0.05:   # segment finishes early → has harvestable slack
+            slack[i] = diff
+        elif diff < -0.01:  # segment overflows
+            overflow[i] = -diff  # positive overflow amount
+
+    # --- Step 2: compute explicit gaps (VAD + natural) -------------------
     def _silence_after_vad(end_s: float) -> float:
         for r in silence_regions:
             if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
                 return r["end_s"] - r["start_s"]
         return 0.0
 
-    def _natural_gap(i: int) -> float:
-        """Time between segment i's end and segment i+1's start."""
-        if i >= n - 1:
-            return 0.0
-        return max(0.0, metrics[i + 1].source_start - metrics[i].source_end)
+    explicit_gaps = [0.0] * n
+    for i in range(n):
+        vad_gap = _silence_after_vad(metrics[i].source_end)
+        nat_gap = (max(0.0, metrics[i + 1].source_start - metrics[i].source_end)
+                   if i < n - 1 else 0.0)
+        explicit_gaps[i] = max(vad_gap, nat_gap)
 
-    # Each segment position has a gap capacity = max(VAD gap, natural gap)
-    gap_capacity = [max(_silence_after_vad(metrics[i].source_end),
-                        _natural_gap(i))
-                    for i in range(n)]
-    gap_remaining = list(gap_capacity)  # mutable copy
+    # --- Step 3: pool the total available budget -------------------------
+    total_slack = sum(slack)
+    total_gaps  = sum(explicit_gaps)
+    total_budget = total_slack + total_gaps
+    total_overflow = sum(overflow)
 
-    # --- Step 2: initial action for every segment (no gap available) -----
-    actions: list[AlignAction] = []
-    for m in metrics:
-        actions.append(decide_action(m, available_gap_s=0.0))
+    # --- Step 4: prioritize overflow segments ----------------------------
+    # (overflow_amount, segment_index) sorted worst-first
+    overflow_candidates = sorted(
+        [(overflow[i], i) for i in range(n) if overflow[i] > 0.01],
+        key=lambda x: -x[0],
+    )
 
-    # --- Step 3: find segments that could benefit from gap time ----------
-    # Candidate = (overflow, segment_index)
-    candidates = []
-    for m in metrics:
-        if m.overflow_s > 0.01:  # needs gap time
-            candidates.append((m.overflow_s, m.index))
-
-    # Sort by overflow descending — worst overflow gets first pick
-    candidates.sort(key=lambda x: -x[0])
-
-    # --- Step 4: allocate gaps by priority -------------------------------
+    # --- Step 5: allocate budget to overflow segments --------------------
     gap_assignments: dict[int, float] = {}  # seg_index → gap_shift amount
+    budget_remaining = total_budget
 
-    for overflow, idx in candidates:
-        m = metrics[idx]
-        # Try the gap right after this segment first
-        if gap_remaining[idx] >= overflow:
-            gap_assignments[idx] = overflow
-            gap_remaining[idx] -= overflow
-            actions[idx] = AlignAction.GAP_SHIFT
-            continue
+    for ov, idx in overflow_candidates:
+        if budget_remaining <= 0.01:
+            break
+        alloc = min(ov, budget_remaining)
+        gap_assignments[idx] = alloc
+        budget_remaining -= alloc
 
-        # Try adjacent gaps (look one segment before and after)
-        best_gap_idx = None
-        best_gap_val = 0.0
+    # --- Step 6: determine actions and build schedule --------------------
+    # Compute how much slack to harvest from each slack segment
+    # Distribute proportionally based on available slack
+    slack_to_harvest = min(total_slack, total_overflow)
+    harvest_fractions = {}
+    if total_slack > 0 and slack_to_harvest > 0:
+        for i in range(n):
+            if slack[i] > 0:
+                # Each slack segment donates proportional to its slack
+                harvest_fractions[i] = slack[i] / total_slack * slack_to_harvest
 
-        for g in range(max(0, idx - 1), min(n, idx + 2)):
-            if gap_remaining[g] >= overflow and gap_remaining[g] > best_gap_val:
-                best_gap_idx = g
-                best_gap_val = gap_remaining[g]
-
-        if best_gap_idx is not None:
-            gap_assignments[idx] = overflow
-            gap_remaining[best_gap_idx] -= overflow
-            actions[idx] = AlignAction.GAP_SHIFT
-            continue
-
-        # Partial allocation: use whatever gap is available at this position
-        available = gap_remaining[idx]
-        if available > 0.01:
-            # Partial gap_shift — reduces overflow but may not fully fix it
-            reduced_overflow = overflow - available
-            gap_assignments[idx] = available
-            gap_remaining[idx] = 0.0
-            # Re-evaluate action with reduced overflow
-            sf_reduced = (m.predicted_tts_s - available) / m.source_duration_s \
-                if m.source_duration_s > 0 else m.predicted_stretch
-            if sf_reduced <= 1.1:
-                actions[idx] = AlignAction.ACCEPT
-            elif sf_reduced <= 1.4:
-                actions[idx] = AlignAction.MILD_STRETCH
-            else:
-                actions[idx] = AlignAction.GAP_SHIFT
-
-    # --- Step 5: build the schedule with cumulative drift ----------------
     aligned: list[AlignedSegment] = []
     cumulative_drift = 0.0
 
     for i, m in enumerate(metrics):
-        action    = actions[i]
         gap_shift = gap_assignments.get(i, 0.0)
-        stretch   = 1.0
+        harvested = harvest_fractions.get(i, 0.0)
 
-        if action == AlignAction.MILD_STRETCH:
-            stretch = min(m.predicted_stretch, max_stretch)
-        # For GAP_SHIFT, gap_shift is already set from assignments
+        # Determine action
+        if gap_shift > 0.01:
+            # This segment gets extra time via gap_shift
+            effective_stretch = m.predicted_tts_s / (m.source_duration_s + gap_shift) \
+                if (m.source_duration_s + gap_shift) > 0 else m.predicted_stretch
+            if effective_stretch <= 1.1:
+                action = AlignAction.ACCEPT
+            elif effective_stretch <= 1.4:
+                action = AlignAction.MILD_STRETCH
+            else:
+                action = AlignAction.GAP_SHIFT
+            stretch = min(effective_stretch, max_stretch) if action == AlignAction.MILD_STRETCH else 1.0
+        else:
+            # Normal action evaluation (no gap allocated)
+            available = explicit_gaps[i]
+            action = decide_action(m, available_gap_s=available)
+            stretch = 1.0
+            if action == AlignAction.GAP_SHIFT:
+                gap_shift = m.overflow_s
+            elif action == AlignAction.MILD_STRETCH:
+                stretch = min(m.predicted_stretch, max_stretch)
+
+        # Compress slack segments: shorten their scheduled window
+        compression = harvested if harvested > 0 else 0.0
 
         sched_start = m.source_start + cumulative_drift
-        sched_end   = sched_start + m.source_duration_s + gap_shift
+        sched_end   = sched_start + m.source_duration_s + gap_shift - compression
 
         aligned.append(AlignedSegment(
             index           = m.index,
@@ -458,6 +465,8 @@ def global_align_dp(
             stretch_factor  = stretch,
         ))
 
-        cumulative_drift += gap_shift
+        # Drift: gap_shifts push forward, compressions pull back
+        cumulative_drift += gap_shift - compression
 
     return aligned
+
