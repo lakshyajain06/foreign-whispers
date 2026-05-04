@@ -44,7 +44,6 @@ async def diarize_endpoint(video_id: str):
         )
 
     # ---- YOUR CODE HERE ----
-    # Step 1: Extract audio from video
     video_path = settings.videos_dir / f"{title}.mp4"
     audio_path = diar_dir / f"{title}.wav"
     subprocess.run(
@@ -70,7 +69,6 @@ async def diarize_endpoint(video_id: str):
         labeled_segments = assign_speakers(transcript.get("segments", []), diar_segments)
         transcript["segments"] = labeled_segments
         transcript_path.write_text(json.dumps(transcript))
-        
+
     # Step 5: Return DiarizeResponse
     return DiarizeResponse(video_id=video_id, speakers=speakers, segments=diar_segments)
-    # ---- END YOUR CODE ----

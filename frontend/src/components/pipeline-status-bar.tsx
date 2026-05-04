@@ -12,7 +12,7 @@ const STAGE_MESSAGES: Record<PipelineStage, string> = {
   stitch: "Stitching audio, video, and subtitles with ffmpeg...",
 };
 
-const STAGE_ORDER: PipelineStage[] = ["download", "transcribe", "translate", "tts", "stitch"];
+const STAGE_ORDER: PipelineStage[] = ["download", "transcribe", "diarize", "translate", "tts", "stitch"];
 
 function formatElapsed(ms: number | undefined): string {
   if (ms == null) return "";

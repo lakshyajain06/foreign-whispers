@@ -62,11 +62,13 @@ services:
         USER_UID: "${UID:-1000}"
         USER_GID: "${GID:-1000}"
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8080:8080"
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      - CHATTERB  OX_API_URL=http://localhost:8020
+      - CHATTERBOX_API_URL=http://host.docker.internal:8020
       - FW_WHISPER_MODEL=base
+      - FW_HF_TOKEN=${FW_HF_TOKEN}
     volumes:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers
@@ -80,10 +82,13 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        API_URL: "http://host.docker.internal:8080"
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8501:8501"
     environment:
-      - API_URL=http://localhost:8080
+      - API_URL=http://host.docker.internal:8080
       - HOSTNAME=0.0.0.0
       - PORT=8501
     healthcheck:

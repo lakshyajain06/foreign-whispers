@@ -22,6 +22,7 @@ import { computeConfigEntries, type ConfigEntry } from "@/lib/config-id";
 const STAGES: PipelineStage[] = [
   "download",
   "transcribe",
+  "diarize",
   "translate",
   "tts",
   "stitch",

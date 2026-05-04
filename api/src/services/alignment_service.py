@@ -1,4 +1,5 @@
 """AlignmentService: wraps VAD, diarization, and evaluation for the FastAPI layer."""
+from api.src.core.torchaudio_compat import apply as _apply_torch_compat
 from foreign_whispers.diarization import diarize_audio
 from foreign_whispers.evaluation import clip_evaluation_report
 from foreign_whispers.vad import detect_speech_activity as _detect
@@ -20,6 +21,7 @@ class AlignmentService:
 
     def diarize(self, audio_path: str) -> list[dict]:
         """Return [{start_s, end_s, speaker}]. Empty list if pyannote absent or no token."""
+        _apply_torch_compat()
         return diarize_audio(audio_path, hf_token=self._settings.hf_token or None)
 
     def evaluate_clip(self, metrics: list, aligned: list) -> dict:
