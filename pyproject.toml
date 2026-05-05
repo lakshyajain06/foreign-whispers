@@ -26,9 +26,8 @@ dependencies = [
     "setuptools<81",
     "pyyaml>=6.0.3",
     "logfire",
-    "groq>=1.2.0",
-    "silabeador>=1.2.2.post1",
-    "pyphen>=0.17.2",
+    "sentence-transformers",
+    "ipykernel>=7.2.0",
 ]
 
 [dependency-groups]
@@ -41,7 +40,11 @@ alignment = [
     "logfire",
     "silero-vad",
     "pyannote.audio",
-    "torchcodec",  # <--- Add this line
+    "pyphen",
+    "scikit-learn",
+    "matplotlib",
+    "jupyterlab",
+    "torchcodec>=0.11.1",
 ]
 
 [tool.uv]
@@ -50,6 +53,19 @@ constraint-dependencies = [
     "numpy<2",
     "transformers<4.46",
 ]
+find-links = [
+    "https://download.pytorch.org/whl/cu128",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
