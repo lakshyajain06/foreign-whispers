@@ -17,9 +17,34 @@ class TTSService:
         self.ui_dir = ui_dir
         self.tts_engine = tts_engine
 
-    def text_file_to_speech(self, source_path: str, output_path: str, *, alignment: bool | None = None) -> None:
-        """Generate time-aligned TTS audio from a translated JSON transcript."""
-        tts_text_file_to_speech(source_path, output_path, self.tts_engine, alignment=alignment)
+    def text_file_to_speech(
+        self,
+        source_path: str,
+        output_path: str,
+        *,
+        alignment: bool | None = None,
+        speaker_wav: str | None = None,
+        speaker_voices: dict[str, str] | None = None,
+    ) -> None:
+        """Generate time-aligned TTS audio from a translated JSON transcript.
+
+        *speaker_wav* (Task 3) sets a single reference WAV used for all
+        segments unless overridden per-speaker. Path is relative to
+        ``pipeline_data/speakers/``.
+
+        *speaker_voices* (Task 4) maps speaker label → reference WAV path.
+        When provided, segments carrying a matching ``speaker`` field are
+        synthesized with that per-speaker reference voice. Falls back to
+        *speaker_wav* for any segment whose speaker isn't in the map.
+        """
+        tts_text_file_to_speech(
+            source_path,
+            output_path,
+            self.tts_engine,
+            alignment=alignment,
+            speaker_wav=speaker_wav,
+            speaker_voices=speaker_voices,
+        )
 
     @staticmethod
     def title_for_video_id(video_id: str, search_dir: pathlib.Path) -> str | None:

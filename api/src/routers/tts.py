@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from api.src.core.config import settings
 from api.src.core.dependencies import resolve_title
 from api.src.services.tts_service import TTSService
+from foreign_whispers.voice_resolution import resolve_speaker_wav
 
 router = APIRouter(prefix="/api")
 
@@ -27,6 +28,12 @@ async def tts_endpoint(
     request: Request,
     config: str = Query(..., pattern=r"^c-[0-9a-f]{7}$"),
     alignment: bool = Query(False),
+    speaker_wav: str | None = Query(
+        None,
+        description="Reference voice WAV path relative to pipeline_data/speakers/ "
+                    "(e.g. 'es/default.wav'). If omitted, auto-resolves to the "
+                    "language default via resolve_speaker_wav().",
+    ),
 ):
     """Generate TTS audio for a translated transcript.
 
@@ -55,10 +62,66 @@ async def tts_endpoint(
             "config": config,
         }
 
-    source_path = str(trans_dir / f"{title}.json")
+    source_path = trans_dir / f"{title}.json"
+
+    # ── Voice selection (Tasks 3 + 4 + gender pooling) ──────────────
+    # Three layers, evaluated per segment at synthesis time:
+    #   1. speaker_voices (Task 4 — per-speaker map): wins when a segment's
+    #      speaker label has an entry. Each entry is built using the
+    #      4-tier resolve_speaker_wav() chain: manual pin → gender pool →
+    #      language default → global default.
+    #   2. speaker_wav (Task 3 — single global voice): fallback applied to
+    #      segments whose speaker isn't in the map (or all segments when
+    #      no diarization data exists). Auto-resolved if not provided.
+    #   3. (in engine) Chatterbox server default if both above are absent.
+    target_lang = "es"
+    if source_path.exists():
+        translated = json.loads(source_path.read_text())
+        target_lang = translated.get("target_language", "es")
+
+    if speaker_wav is None:
+        speaker_wav = resolve_speaker_wav(settings.speakers_dir, target_lang)
+
+    # Read per-speaker genders from the diarization cache (if present).
+    diar_path = settings.diarizations_dir / f"{title}.json"
+    gender_map: dict[str, str] = {}
+    if diar_path.exists():
+        diar_data = json.loads(diar_path.read_text())
+        gender_map = diar_data.get("genders", {})
+
+    speaker_voices: dict[str, str] = {}
+    if source_path.exists():
+        # Compute round-robin pool indices: each speaker of a given gender
+        # gets a unique slot in the gender pool (encounter order).
+        speaker_pool_index: dict[str, int] = {}
+        gender_counters = {"male": 0, "female": 0}
+        for seg in translated.get("segments", []):
+            sp = seg.get("speaker")
+            if sp and sp not in speaker_pool_index:
+                gen = gender_map.get(sp)
+                if gen in ("male", "female"):
+                    speaker_pool_index[sp] = gender_counters[gen]
+                    gender_counters[gen] += 1
+
+        unique_speakers = {
+            s.get("speaker")
+            for s in translated.get("segments", [])
+            if s.get("speaker")
+        }
+        for speaker in unique_speakers:
+            speaker_voices[speaker] = resolve_speaker_wav(
+                settings.speakers_dir,
+                target_lang,
+                speaker_id=speaker,
+                gender=gender_map.get(speaker),
+                gender_pool_index=speaker_pool_index.get(speaker, 0),
+            )
 
     await _run_in_threadpool(
-        None, svc.text_file_to_speech, source_path, str(audio_dir), alignment=alignment
+        None, svc.text_file_to_speech, str(source_path), str(audio_dir),
+        alignment=alignment,
+        speaker_wav=speaker_wav,
+        speaker_voices=speaker_voices or None,
     )
 
     return {
