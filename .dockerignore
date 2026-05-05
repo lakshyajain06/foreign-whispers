@@ -9,3 +9,4 @@ docs/
 *.mov
 *.webm
 .env
+cookies*.txt

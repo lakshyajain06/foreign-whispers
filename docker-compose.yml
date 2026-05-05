@@ -62,11 +62,20 @@ services:
         USER_UID: "${UID:-1000}"
         USER_GID: "${GID:-1000}"
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8080:8080"
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    env_file:
+      - .env
     environment:
-      - CHATTERBOX_API_URL=http://localhost:8020
+      - CHATTERBOX_API_URL=http://chatterbox-gpu:8020
+      - FW_WHISPER_API_URL=http://whisper-gpu:8000
       - FW_WHISPER_MODEL=base
+      # TTS worker concurrency. 3 (default) is fast but triggers Chatterbox CUDA
+      # asserts under sustained voice-cloning load. 1 is sequential and reliable
+      # but slow. 2 is the trial middle ground — try this first; if CUDA crashes
+      # come back, drop to 1.
+      - FW_TTS_WORKERS=1
     volumes:
       - ./pipeline_data:/app/pipeline_data
       - ./foreign_whispers:/app/foreign_whispers
@@ -80,10 +89,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        API_URL: http://api:8080
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8501:8501"
     environment:
-      - API_URL=http://localhost:8080
+      - API_URL=http://api:8080
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
       - HOSTNAME=0.0.0.0
       - PORT=8501
     healthcheck:

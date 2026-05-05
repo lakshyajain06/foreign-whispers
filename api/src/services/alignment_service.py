@@ -1,4 +1,5 @@
 """AlignmentService: wraps VAD, diarization, and evaluation for the FastAPI layer."""
+from api.src.core.torchaudio_back_compat import apply as _apply_torchaudio_compat
 from foreign_whispers.diarization import diarize_audio
 from foreign_whispers.evaluation import clip_evaluation_report
 from foreign_whispers.vad import detect_speech_activity as _detect
