@@ -28,6 +28,7 @@ dependencies = [
     "logfire",
     "sentence-transformers",
     "ipykernel>=7.2.0",
+    "groq>=1.2.0",
 ]
 
 [dependency-groups]

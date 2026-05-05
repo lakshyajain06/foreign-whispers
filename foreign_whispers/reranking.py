@@ -8,6 +8,10 @@ SegmentMetrics.  The translation re-ranking function is a **student assignment**
 import dataclasses
 import logging
 
+import json
+import os
+from groq import Groq
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,72 +99,131 @@ def analyze_failures(report: dict) -> FailureAnalysis:
         suggested_change="Review individual outlier segments if any remain.",
     )
 
+def llm_shorten(
+    source_text: str,
+    baseline_es: str,
+    target_chars: int,
+    context_prev: str,
+    context_next: str,
+) -> list[str]:
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+    context_block = ""
+    if context_prev:
+        context_block += f"Previous segment: {context_prev}\n"
+    if context_next:
+        context_block += f"Next segment: {context_next}\n"
+
+    prompt = f"""You are a professional Spanish dubbing translator. Shorten the Spanish translation to fit within {target_chars} characters while preserving meaning.
+    Original English: {source_text}
+    Baseline Spanish: {baseline_es}
+    {context_block}
+    Return ONLY a JSON array of 3 shortened Spanish candidates, shortest first. No explanation, no markdown, just the raw JSON array.
+    Example: ["short version 1", "short version 2", "short version 3"]"""
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=256,
+        temperature=0.3,  # l1ow temp for consistency
+    )
+
+    raw = response.choices[0].message.content.strip()
+    return [c for c in json.loads(raw) if isinstance(c, str)]
+
+import os
+import json
+import logging
+from groq import Groq
+
+logger = logging.getLogger(__name__)
+
+# Assuming TranslationCandidate is imported/defined elsewhere in your file
+# from whatever_module import TranslationCandidate
 
 def get_shorter_translations(
     source_text: str,
     baseline_es: str,
     target_duration_s: float,
-    context_prev: str = "",
-    context_next: str = "",
 ) -> list[TranslationCandidate]:
-    """Return shorter translation candidates that fit *target_duration_s*.
+    """LLM-based shorter translation generation using Groq, mimicking the hybrid pipeline."""
+    if not baseline_es or not baseline_es.strip():
+        return []
 
-    .. admonition:: Student Assignment — Duration-Aware Translation Re-ranking
+    baseline_len = len(baseline_es)
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-       This function is intentionally a **stub that returns an empty list**.
-       Your task is to implement a strategy that produces shorter
-       target-language translations when the baseline translation is too long
-       for the time budget.
+    # We ask the LLM to mimic the distinct strategies of the original pipeline
+    prompt = f"""You are a professional Spanish dubbing translator. Your goal is to shorten the baseline Spanish translation while preserving meaning.
+    
+    Original English: {source_text}
+    Baseline Spanish (Length: {baseline_len}): {baseline_es}
+    
+    Generate exactly 3 shorter candidates using different strategies:
+    1. A version that only removes filler words or contracts phrases (Rule-based mimic).
+    2. A version that completely rephrases the sentence to be more concise (Alt-translate mimic).
+    3. The absolute shortest possible natural-sounding version.
+    
+    Return ONLY a JSON array of objects with "text" and "rationale" keys. Do NOT wrap in markdown.
+    Example: 
+    [
+      {{"text": "short version", "rationale": "removed filler words"}},
+      {{"text": "another version", "rationale": "rephrased entirely"}}
+    ]"""
 
-       **Inputs**
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.3, 
+        )
 
-       ============== ======== ==================================================
-       Parameter      Type     Description
-       ============== ======== ==================================================
-       source_text    str      Original source-language segment text
-       baseline_es    str      Baseline target-language translation (from argostranslate)
-       target_duration_s float Time budget in seconds for this segment
-       context_prev   str      Text of the preceding segment (for coherence)
-       context_next   str      Text of the following segment (for coherence)
-       ============== ======== ==================================================
+        raw = response.choices[0].message.content.strip()
 
-       **Outputs**
+        # Clean up markdown block ticks if the LLM ignores instructions
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+            
+        parsed_data = json.loads(raw.strip())
+        
+        if not isinstance(parsed_data, list):
+            logger.warning("[rerank] LLM did not return a list.")
+            return []
 
-       A list of ``TranslationCandidate`` objects, sorted shortest first.
-       Each candidate has:
+    except Exception as e:
+        logger.error(f"[rerank] Groq LLM generation/parsing failed: {e}")
+        return []
 
-       - ``text``: the shortened target-language translation
-       - ``char_count``: ``len(text)``
-       - ``brevity_rationale``: short note on what was changed
+    candidates = []
+    seen = set()
 
-       **Duration heuristic**: target-language TTS produces ~15 characters/second
-       (or ~4.5 syllables/second for Romance languages).  So a 3-second budget
-       ≈ 45 characters.
+    for item in parsed_data:
+        if isinstance(item, dict) and "text" in item:
+            text = item["text"].strip()
+            rationale = item.get("rationale", "LLM shortened")
+            
+            # The ONLY strict requirement: must be shorter than baseline
+            if text and text not in seen and len(text) < baseline_len:
+                seen.add(text)
+                candidates.append(
+                    TranslationCandidate(
+                        text=text,
+                        char_count=len(text),
+                        brevity_rationale=rationale
+                    )
+                )
 
-       **Approaches to consider** (pick one or combine):
-
-       1. **Rule-based shortening** — strip filler words, use shorter synonyms
-          from a lookup table, contract common phrases
-          (e.g. "en este momento" → "ahora").
-       2. **Multiple translation backends** — call argostranslate with
-          paraphrased input, or use a second translation model, then pick
-          the shortest output that preserves meaning.
-       3. **LLM re-ranking** — use an LLM (e.g. via an API) to generate
-          condensed alternatives.  This was the previous approach but adds
-          latency, cost, and a runtime dependency.
-       4. **Hybrid** — rule-based first, fall back to LLM only for segments
-          that still exceed the budget.
-
-       **Evaluation criteria**: the caller selects the candidate whose
-       ``len(text) / 15.0`` is closest to ``target_duration_s``.
-
-    Returns:
-        Empty list (stub).  Implement to return ``TranslationCandidate`` items.
-    """
-    logger.info(
-        "get_shorter_translations called for %.1fs budget (%d chars baseline) — "
-        "returning empty list (student assignment stub).",
-        target_duration_s,
-        len(baseline_es),
+    # Return sorted by length (shortest first)
+    candidates.sort(key=lambda c: c.char_count)
+    
+    logger.debug(
+        "[rerank] baseline=%dc -> %d candidate(s) via Groq",
+        baseline_len, len(candidates),
     )
-    return []
+    
+    return candidates
