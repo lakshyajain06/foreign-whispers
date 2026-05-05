@@ -18,37 +18,27 @@ import re
 import unicodedata
 from enum import Enum
 
-import pyphen # syllabbifier lib
 
 def _count_syllables(text: str) -> int:
-    """Count syllables in target-language text using Pyphen.
+    """Count syllables in target-language text via vowel-cluster counting.
 
-    Designed for Spanish (lang='es'). Returns at least 1 for any non-empty text.
+    Designed for Romance languages (Spanish, French, Italian, Portuguese).
+    Strips accents then counts contiguous vowel runs. Each run = one syllable.
+    Returns at least 1 for any non-empty text so the rate never divides by zero.
     """
-    if not text.strip():
-        return 0
-    dic = pyphen.Pyphen(lang='es')
-    count = 0
-    for word in text.split():
-        # Pyphen returns 'word-with-hy-phens'
-        hyphenated = dic.inserted(word)
-        count += len(hyphenated.split('-'))
-    return max(1, count)
+    # Normalise: decompose accented chars, keep only ASCII letters + spaces
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    clusters = re.findall(r"[aeiou]+", ascii_text)
+    return max(1, len(clusters))
 
 
-# Linear regression constants (seconds = syllables * slope + overhead)
-# Updated from regression results in alignment_integration.ipynb
-_SYLLABLE_SLOPE = 0.0897  # Seconds per syllable
-_TTS_OVERHEAD = 0.7168    # Fixed silence/buffer intercept
+_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
 
 
 def _estimate_duration(text: str) -> float:
     """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    syllables = _count_syllables(text)
-    if syllables == 0:
-        return 0.0
-    
-    return (syllables * _SYLLABLE_SLOPE) + _TTS_OVERHEAD
+    return _count_syllables(text) / _SYLLABLE_RATE
 
 
 @dataclasses.dataclass
@@ -308,165 +298,3 @@ def global_align(
         cumulative_drift += gap_shift
 
     return aligned
-
-
-def global_align_dp(
-    metrics:         list[SegmentMetrics],
-    silence_regions: list[dict],
-    max_stretch:     float = 1.4,
-) -> list[AlignedSegment]:
-    """Slack-redistribution global alignment optimizer.
-
-    Improvements over greedy ``global_align``:
-
-    1. **Slack harvesting** — segments where predicted TTS is shorter than
-       the source window have *slack* (unused time).  The greedy algorithm
-       ignores this; we harvest it and redistribute to overflow segments.
-    2. **Priority allocation** — overflow segments are ranked by severity
-       (worst first) and receive harvested slack before milder cases.
-    3. **Natural gap detection** — also detects inter-segment gaps from
-       Whisper timestamps and VAD silence regions.
-
-    The key insight: in the test data, 78 segments have a combined 236 s of
-    slack while only 12 s of overflow is needed.  By compressing the
-    scheduled windows of slack segments, we free up virtual gaps that
-    overflow segments can shift into.
-
-    Algorithm:
-
-    1. Compute per-segment slack (source_duration − predicted_tts, if > 0)
-       and per-segment overflow.
-    2. Also compute natural inter-segment gaps and VAD gaps.
-    3. Pool all available time: slack + gaps = total budget.
-    4. Sort overflow segments by severity (worst first).
-    5. Allocate budget to overflow segments as gap_shifts, converting
-       ``REQUEST_SHORTER`` / ``FAIL`` into ``GAP_SHIFT``.
-    6. Build the final schedule: slack segments get compressed windows,
-       overflow segments get extended windows, cumulative drift is tracked.
-
-    Args:
-        metrics: Per-segment timing metrics from ``compute_segment_metrics``.
-        silence_regions: VAD output — list of ``{"start_s", "end_s", "label"}``
-            dicts.  Pass ``[]`` if VAD is unavailable.
-        max_stretch: Upper bound for ``MILD_STRETCH`` speed factor.
-
-    Returns:
-        One ``AlignedSegment`` per input metric, in order.
-    """
-    if not metrics:
-        return []
-
-    n = len(metrics)
-
-    # --- Step 1: compute per-segment slack and overflow ------------------
-    slack  = [0.0] * n  # time we can harvest from each segment
-    overflow = [0.0] * n  # time each segment needs beyond its window
-
-    for i, m in enumerate(metrics):
-        diff = m.source_duration_s - m.predicted_tts_s
-        if diff > 0.05:   # segment finishes early → has harvestable slack
-            slack[i] = diff
-        elif diff < -0.01:  # segment overflows
-            overflow[i] = -diff  # positive overflow amount
-
-    # --- Step 2: compute explicit gaps (VAD + natural) -------------------
-    def _silence_after_vad(end_s: float) -> float:
-        for r in silence_regions:
-            if r.get("label") == "silence" and r["start_s"] >= end_s - 0.1:
-                return r["end_s"] - r["start_s"]
-        return 0.0
-
-    explicit_gaps = [0.0] * n
-    for i in range(n):
-        vad_gap = _silence_after_vad(metrics[i].source_end)
-        nat_gap = (max(0.0, metrics[i + 1].source_start - metrics[i].source_end)
-                   if i < n - 1 else 0.0)
-        explicit_gaps[i] = max(vad_gap, nat_gap)
-
-    # --- Step 3: pool the total available budget -------------------------
-    total_slack = sum(slack)
-    total_gaps  = sum(explicit_gaps)
-    total_budget = total_slack + total_gaps
-    total_overflow = sum(overflow)
-
-    # --- Step 4: prioritize overflow segments ----------------------------
-    # (overflow_amount, segment_index) sorted worst-first
-    overflow_candidates = sorted(
-        [(overflow[i], i) for i in range(n) if overflow[i] > 0.01],
-        key=lambda x: -x[0],
-    )
-
-    # --- Step 5: allocate budget to overflow segments --------------------
-    gap_assignments: dict[int, float] = {}  # seg_index → gap_shift amount
-    budget_remaining = total_budget
-
-    for ov, idx in overflow_candidates:
-        if budget_remaining <= 0.01:
-            break
-        alloc = min(ov, budget_remaining)
-        gap_assignments[idx] = alloc
-        budget_remaining -= alloc
-
-    # --- Step 6: determine actions and build schedule --------------------
-    # Compute how much slack to harvest from each slack segment
-    # Distribute proportionally based on available slack
-    slack_to_harvest = min(total_slack, total_overflow)
-    harvest_fractions = {}
-    if total_slack > 0 and slack_to_harvest > 0:
-        for i in range(n):
-            if slack[i] > 0:
-                # Each slack segment donates proportional to its slack
-                harvest_fractions[i] = slack[i] / total_slack * slack_to_harvest
-
-    aligned: list[AlignedSegment] = []
-    cumulative_drift = 0.0
-
-    for i, m in enumerate(metrics):
-        gap_shift = gap_assignments.get(i, 0.0)
-        harvested = harvest_fractions.get(i, 0.0)
-
-        # Determine action
-        if gap_shift > 0.01:
-            # This segment gets extra time via gap_shift
-            effective_stretch = m.predicted_tts_s / (m.source_duration_s + gap_shift) \
-                if (m.source_duration_s + gap_shift) > 0 else m.predicted_stretch
-            if effective_stretch <= 1.1:
-                action = AlignAction.ACCEPT
-            elif effective_stretch <= 1.4:
-                action = AlignAction.MILD_STRETCH
-            else:
-                action = AlignAction.GAP_SHIFT
-            stretch = min(effective_stretch, max_stretch) if action == AlignAction.MILD_STRETCH else 1.0
-        else:
-            # Normal action evaluation (no gap allocated)
-            available = explicit_gaps[i]
-            action = decide_action(m, available_gap_s=available)
-            stretch = 1.0
-            if action == AlignAction.GAP_SHIFT:
-                gap_shift = m.overflow_s
-            elif action == AlignAction.MILD_STRETCH:
-                stretch = min(m.predicted_stretch, max_stretch)
-
-        # Compress slack segments: shorten their scheduled window
-        compression = harvested if harvested > 0 else 0.0
-
-        sched_start = m.source_start + cumulative_drift
-        sched_end   = sched_start + m.source_duration_s + gap_shift - compression
-
-        aligned.append(AlignedSegment(
-            index           = m.index,
-            original_start  = m.source_start,
-            original_end    = m.source_end,
-            scheduled_start = sched_start,
-            scheduled_end   = sched_end,
-            text            = m.translated_text,
-            action          = action,
-            gap_shift_s     = gap_shift,
-            stretch_factor  = stretch,
-        ))
-
-        # Drift: gap_shifts push forward, compressions pull back
-        cumulative_drift += gap_shift - compression
-
-    return aligned
-
