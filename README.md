@@ -2,6 +2,19 @@ Joshua Woo jjw9119@nyu.edu
 Lakshya Jain lj2515@nyu.edu
 https://drive.google.com/drive/u/3/folders/1egWLIyaTAt4q2IaC0xsbgjXGHL5aGGZm?q=owner:us2193%40nyu.edu%20parent:1egWLIyaTAt4q2IaC0xsbgjXGHL5aGGZm
 
+## Known Issues & Hardware Compatibility
+
+### NVIDIA 50-Series (Blackwell) & CUDA 12+ Compatibility
+Users with the newest NVIDIA 50-series GPUs may encounter `AttributeError` or weight-loading issues when using older versions of `pytorch`, `torchaudio`, `pyannote`, as well as other python libraries. 
+*   **Symptom:** `module 'torchaudio' has no attribute 'AudioMetaData'` or `weights_only` loading errors.
+*   **Fix:** Tried fixing using more updated versions of Python libraries but still encountered problems with structure of code
+as well as unaccessibility with backwards compatibility. Implemented a file to account for backwards compatability.
+### Google Colab Limitations
+Running the pipeline in Google Colab can be difficult due to conflicting pre-installed versions of `pyannote.audio` and `speechbrain`.
+*   **Recommendation:** For the best experience, use the provided **Docker** environment. If you must use Colab, refer to the setup cells in the provided integration notebooks to handle library version overrides.
+
+---
+
 # Foreign Whispers
 
 [![License: AGPL-3.0 + Commons Clause](https://img.shields.io/badge/License-Source_Available-blue.svg)](./LICENSE)
