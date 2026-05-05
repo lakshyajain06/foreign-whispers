@@ -18,27 +18,154 @@ import re
 import unicodedata
 from enum import Enum
 
+import pyphen as _pyphen
 
-def _count_syllables(text: str) -> int:
+import json
+import pathlib
+import math
+from typing import Optional
+
+_VOWEL_PATTERNS: dict[str, str] = {
+    # Romance — open vowel systems
+    "es": "aeiouáéíóúü",       # Spanish
+    "fr": "aeiouyàâäéèêëîïôùûüÿœæ",  # French — nasal vowels still cluster
+    "it": "aeiouàèéìíîòóùú",   # Italian
+    "pt": "aeiouáâãàéêíóôõú",  # Portuguese
+    "ro": "aeiouăâî",           # Romanian
+    # Germanic
+    "de": "aeiouäöüy",
+    "nl": "aeiouäöüy",
+    "en": "aeiouy",
+    # Default fallback (Latin script)
+    "_":  "aeiouy",
+}
+
+_SYLLABLE_RATES: dict[str, float] = {
+    "es": 5.0,
+    "fr": 4.6,
+    "it": 5.1,
+    "pt": 4.8,
+    "ro": 4.5,
+    "de": 3.8,
+    "nl": 4.0,
+    "en": 4.0,
+    "_":  4.5,   # original library default — keeps backward compat for unknown langs
+}
+
+_SCALE          = 1.05
+_WORD_OVERHEAD  = 0.018
+_PAUSE_OVERHEAD = 0.12
+_INTERCEPT      = 0.0
+
+
+def _load_fitted_coefficients() -> None:
+    global _SCALE, _WORD_OVERHEAD, _PAUSE_OVERHEAD, _INTERCEPT
+
+    json_path = pathlib.Path(__file__).parent / "data" / "duration_model.json"
+    if not json_path.exists():
+        return
+    try:
+        data = json.loads(json_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+
+    _SCALE          = float(data.get("scale",          _SCALE))
+    _WORD_OVERHEAD  = float(data.get("word_overhead",  _WORD_OVERHEAD))
+    _PAUSE_OVERHEAD = float(data.get("pause_overhead", _PAUSE_OVERHEAD))
+    _INTERCEPT      = float(data.get("intercept",      _INTERCEPT))
+
+    rates = data.get("rates")
+    if isinstance(rates, dict):
+        for k, v in rates.items():
+            try:
+                _SYLLABLE_RATES[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+
+
+_load_fitted_coefficients()
+
+_PYPHEN_LANGS = {"es": "es_ES", "fr": "fr_FR", "it": "it_IT",
+                 "pt": "pt_PT", "ro": "ro_RO", "de": "de_DE",
+                 "nl": "nl_NL", "en": "en_US"}
+_pyphen_cache: dict[str, "_pyphen.Pyphen"] = {}
+
+
+def _get_pyphen_dic(lang: str) -> "_pyphen.Pyphen":
+    """Get or lazily create a pyphen instance for the given language."""
+    dic = _pyphen_cache.get(lang)
+    if dic is None:
+        dic = _pyphen.Pyphen(lang=_PYPHEN_LANGS.get(lang, "en_US"))
+        _pyphen_cache[lang] = dic
+    return dic
+
+def _get_lang_key(lang: Optional[str]) -> str:
+    """Normalise a BCP-47 language tag to a two-letter key we have data for."""
+    if not lang:
+        return "_"
+    prefix = lang.lower()[:2]
+    return prefix if prefix in _SYLLABLE_RATES else "_"
+
+
+
+def _count_syllables(text: str, lang: Optional[str] = None) -> int:
     """Count syllables in target-language text via vowel-cluster counting.
 
     Designed for Romance languages (Spanish, French, Italian, Portuguese).
     Strips accents then counts contiguous vowel runs. Each run = one syllable.
     Returns at least 1 for any non-empty text so the rate never divides by zero.
     """
-    # Normalise: decompose accented chars, keep only ASCII letters + spaces
-    nfkd = unicodedata.normalize("NFKD", text.lower())
-    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
-    clusters = re.findall(r"[aeiou]+", ascii_text)
+    if not text:
+        return 1
+
+    lang_key = _get_lang_key(lang)
+
+    pyphen_obj = _get_pyphen_dic(lang_key)
+    if pyphen_obj is not None:
+        total = 0
+        for word in re.findall(r"[^\W\d_]+", text, flags=re.UNICODE):
+            hyphenated = pyphen_obj.inserted(word.lower())
+            total += hyphenated.count("-") + 1
+        return max(1, total)
+
+    if lang_key in _VOWEL_PATTERNS and lang_key != "_":
+        # Language has its own accented-vowel pattern → keep accents intact.
+        vowels  = _VOWEL_PATTERNS[lang_key]
+        working = text.lower()
+    else:
+        # Unknown / generic — strip diacritics so accented vowels still count.
+        # This preserves the pre-notebook_5 behaviour and keeps the legacy
+        # ``test_syllable_count_accents`` test passing.
+        nfkd    = unicodedata.normalize("NFKD", text.lower())
+        working = "".join(c for c in nfkd if not unicodedata.combining(c))
+        vowels  = _VOWEL_PATTERNS["_"]
+
+    pattern  = f"[{re.escape(vowels)}]+"
+    clusters = re.findall(pattern, working)
     return max(1, len(clusters))
 
+def _count_pause_markers(text: str) -> int:
+    return len(re.findall(r"[,;:](?!\s*$)", text))
 
-_SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+def _count_words(text: str) -> int:
+    """Return the number of whitespace-delimited tokens in *text*."""
+    return len(text.split())
 
-
-def _estimate_duration(text: str) -> float:
+def _estimate_duration(text: str, lang: Optional[str] = None) -> float:
     """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+    if not text or not text.strip():
+        return 0.0
+
+    lang_key  = _get_lang_key(lang)
+    rate      = _SYLLABLE_RATES[lang_key]
+    syllables = _count_syllables(text, lang)
+    n_words   = _count_words(text)
+    n_pauses  = _count_pause_markers(text)
+
+    base       = (syllables / rate) * _SCALE
+    correction = n_words * _WORD_OVERHEAD + n_pauses * _PAUSE_OVERHEAD
+    return max(0.0, base + correction + _INTERCEPT)
+
 
 
 @dataclasses.dataclass
@@ -50,7 +177,8 @@ class SegmentMetrics:
     *will the target-language TTS audio fit inside the source time window?*
 
     We estimate the TTS duration using a syllable-rate heuristic
-    (~4.5 syllables/second for Romance languages) and derive three key numbers:
+    (~4.5–5.1 syllables/second depending on language) and derive three key
+    numbers:
 
     Attributes:
         index: Zero-based segment position in the transcript.
@@ -61,10 +189,11 @@ class SegmentMetrics:
         translated_text: Target-language translation.
         src_char_count: Character count of the source text.
         tgt_char_count: Character count of the target text.
-        predicted_tts_s: Estimated TTS duration (syllables / 4.5).
+        lang: Optional BCP-47 language code for the *target* language.
+        predicted_tts_s: Estimated TTS duration from ``_estimate_duration``.
         predicted_stretch: Ratio ``predicted_tts_s / source_duration_s``.
             A value of 1.3 means the target-language audio is predicted to be
-            30% longer than the available window.
+            30 % longer than the available window.
         overflow_s: How many seconds the target-language audio exceeds the
             window (zero when it fits).
     """
@@ -76,12 +205,13 @@ class SegmentMetrics:
     translated_text:   str
     src_char_count:    int
     tgt_char_count:    int
+    lang:              Optional[str]          = None
     predicted_tts_s:   float = dataclasses.field(init=False)
     predicted_stretch: float = dataclasses.field(init=False)
     overflow_s:        float = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
-        self.predicted_tts_s = _estimate_duration(self.translated_text)
+        self.predicted_tts_s = _estimate_duration(self.translated_text, self.lang)
         self.predicted_stretch = (
             self.predicted_tts_s / self.source_duration_s
             if self.source_duration_s > 0 else 1.0
@@ -177,6 +307,7 @@ def decide_action(m: SegmentMetrics, available_gap_s: float = 0.0) -> AlignActio
 def compute_segment_metrics(
     en_transcript: dict,
     es_transcript: dict,
+    lang: Optional[str] = None,
 ) -> list[SegmentMetrics]:
     """Pair source and target segments and compute per-segment timing metrics.
 
@@ -209,8 +340,34 @@ def compute_segment_metrics(
             translated_text   = tgt_text,
             src_char_count    = len(src_text),
             tgt_char_count    = len(tgt_text),
+            lang              = lang,
         ))
     return metrics
+
+def _build_gap_index(silence_regions: list[dict]) -> list[tuple[float, float, float]]:
+   
+    gaps = []
+    for r in silence_regions:
+        if r.get("label") == "silence":
+            s, e = float(r["start_s"]), float(r["end_s"])
+            if e > s:
+                gaps.append((s, e, e - s))
+    gaps.sort(key=lambda t: t[0])
+    return gaps
+
+def _silence_after_fast(end_s: float, gaps: list[tuple[float, float, float]]) -> float:
+    # Binary search for the first gap whose start >= end_s - 0.1
+    lo, hi = 0, len(gaps)
+    target = end_s - 0.1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if gaps[mid][0] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < len(gaps):
+        return gaps[lo][2]
+    return 0.0
 
 
 def global_align(
@@ -298,3 +455,215 @@ def global_align(
         cumulative_drift += gap_shift
 
     return aligned
+
+
+# DP 
+
+_W_OVERLAP        = 20.0   # per-second penalty for segment-to-segment overlap
+_W_SEVERE_STRETCH = 10.0   # flat penalty each time stretch_factor > max_stretch
+_W_DRIFT          = 1.0    # per-second penalty for cumulative timeline drift
+
+_W_REQUEST_SHORTER = 5.0    # downstream re-rank may not find a shorter candidate
+_W_FAIL            = 100.0  # last-resort silence fallback — strongly discouraged
+
+
+_W_STRETCH_GRADIENT = 2.0   # per unit of |stretch_factor − 1.0|
+
+def _segment_cost(
+    action:        AlignAction,
+    gap_shift_s:   float,
+    stretch_factor: float,
+    cumulative_drift: float,
+    overlap_s:     float,
+    max_stretch:   float,
+) -> float:
+    cost = 0.0
+    cost += cumulative_drift * _W_DRIFT
+    cost += overlap_s        * _W_OVERLAP
+    # Smooth stretch penalty (Bug 2): proportional to deviation from 1.0×.
+    cost += abs(stretch_factor - 1.0) * _W_STRETCH_GRADIENT
+    # Hard penalty for severe stretch (kept for callers that bypass clamping).
+    if stretch_factor > max_stretch:
+        cost += _W_SEVERE_STRETCH
+    # Action-specific penalties (Bug 1).
+    if action == AlignAction.REQUEST_SHORTER:
+        cost += _W_REQUEST_SHORTER
+    elif action == AlignAction.FAIL:
+        cost += _W_FAIL
+    return cost
+
+    
+@dataclasses.dataclass(order=True)
+class _BeamState:
+    cost:      float
+    drift:     float
+    decisions: list[tuple[AlignAction, float, float]] = dataclasses.field(
+        default_factory=list, compare=False
+    )
+
+def global_align_dp(
+    metrics:         list[SegmentMetrics],
+    silence_regions: list[dict],
+    max_stretch:     float = 1.4,
+    beam_width:      int   = 8,
+) -> list[AlignedSegment]:
+    if not metrics:
+        return []
+
+    gaps = _build_gap_index(silence_regions)
+
+    # ------------------------------------------------------------------
+    # Candidate generator
+    # ------------------------------------------------------------------
+    def _candidates(
+        m: SegmentMetrics,
+        drift: float,
+    ) -> list[tuple[AlignAction, float, float]]:
+        """Return all feasible (action, gap_shift_s, stretch_factor) triples.
+
+        We always include ACCEPT so the beam is never empty.  We add the
+        other actions according to feasibility, not threshold order, so the
+        beam can explore sub-optimal local choices that may reduce global cost.
+        """
+        avail_gap  = _silence_after_fast(m.source_end, gaps)
+        sf         = m.predicted_stretch
+        candidates = []
+
+        # ACCEPT — only when the segment naturally fits (sf <= 1.1).  For
+        # over-budget segments, ACCEPT means "engine will truncate the
+        # trailing audio" which causes the user-visible silence problem;
+        # exposing it as a candidate here lets the beam pick a free option
+        # that secretly trashes audio.  Keeping ACCEPT restricted to the
+        # natural-fit band mirrors ``decide_action`` semantics.
+        if sf <= 1.1:
+            candidates.append((AlignAction.ACCEPT, 0.0, 1.0))
+
+        # MILD_STRETCH — feasible for any stretch > 1.0; this is the floor
+        # for over-budget segments (always at least one candidate available).
+        # Pass the un-clamped ``sf`` so the cost function can fire the
+        # severe-stretch penalty when the segment can't fit under the cap.
+        # The engine will still clamp at synthesis time, but beam can now
+        # see the truncation cost and prefer REQUEST_SHORTER when warranted.
+        if sf > 1.0:
+            candidates.append((AlignAction.MILD_STRETCH, 0.0, sf))
+
+        # GAP_SHIFT — feasible only when the gap can absorb the overflow
+        if sf > 1.1 and avail_gap >= m.overflow_s:
+            candidates.append((AlignAction.GAP_SHIFT, m.overflow_s, 1.0))
+
+        # PARTIAL GAP_SHIFT — borrow only part of the gap, combine with stretch
+        # This helps when neither pure GAP_SHIFT nor pure MILD_STRETCH alone is ideal.
+        if sf > 1.4 and avail_gap > 0 and avail_gap < m.overflow_s:
+            partial = avail_gap
+            remaining_overflow = m.overflow_s - partial
+            remaining_sf = (m.predicted_tts_s - partial) / m.source_duration_s if m.source_duration_s > 0 else 1.0
+            partial_stretch = min(remaining_sf, max_stretch)
+            candidates.append((AlignAction.GAP_SHIFT, partial, partial_stretch))
+
+        # REQUEST_SHORTER (Bug 4 fix) — feasible whenever the segment is
+        # over-budget AND can't be fully absorbed by silence.  Previously this
+        # only fired for sf > 1.8, which left the (1.4, 1.8] band silently
+        # falling through to a clamped MILD_STRETCH that the engine would then
+        # truncate.  Mirrors the threshold logic in ``decide_action``.
+        if sf > 1.4 and avail_gap < m.overflow_s:
+            candidates.append((AlignAction.REQUEST_SHORTER, 0.0, 1.0))
+
+        # FAIL — always a last resort (expensive but prevents infinite loops)
+        if sf > 2.5:
+            candidates.append((AlignAction.FAIL, 0.0, 1.0))
+
+        return candidates
+
+    # ------------------------------------------------------------------
+    # Beam search
+    # ------------------------------------------------------------------
+    # Initial beam: one empty hypothesis with zero cost and zero drift.
+    beam: list[_BeamState] = [_BeamState(cost=0.0, drift=0.0, decisions=[])]
+
+    for idx, m in enumerate(metrics):
+        # Determine the next segment's original start (for overlap detection).
+        next_start = metrics[idx + 1].source_start if idx + 1 < len(metrics) else math.inf
+
+        next_beam: list[_BeamState] = []
+
+        for hyp in beam:
+            for action, gap_shift_s, stretch_factor in _candidates(m, hyp.drift):
+                # Compute the scheduled end of this segment under this hypothesis.
+                sched_start = m.source_start + hyp.drift
+                sched_end   = sched_start + m.source_duration_s + gap_shift_s
+
+                # Overlap: how far does this segment push into the next one?
+                overlap_s = max(0.0, sched_end - next_start)
+
+                # New cumulative drift after this segment.
+                new_drift = hyp.drift + gap_shift_s
+
+                # Incremental cost for this choice.
+                inc_cost = _segment_cost(
+                    action        = action,
+                    gap_shift_s   = gap_shift_s,
+                    stretch_factor= stretch_factor,
+                    cumulative_drift = new_drift,
+                    overlap_s     = overlap_s,
+                    max_stretch   = max_stretch,
+                )
+
+                next_beam.append(_BeamState(
+                    cost      = hyp.cost + inc_cost,
+                    drift     = new_drift,
+                    decisions = hyp.decisions + [(action, gap_shift_s, stretch_factor)],
+                ))
+
+        # Prune beam: keep only the B lowest-cost hypotheses.
+        next_beam.sort(key=lambda h: h.cost)
+        beam = next_beam[:beam_width]
+
+    # ------------------------------------------------------------------
+    # Reconstruct the best hypothesis
+    # ------------------------------------------------------------------
+    best = beam[0]
+    aligned: list[AlignedSegment] = []
+    cumulative_drift = 0.0
+
+    for m, (action, gap_shift_s, stretch_factor) in zip(metrics, best.decisions):
+        sched_start = m.source_start + cumulative_drift
+        sched_end   = sched_start + m.source_duration_s + gap_shift_s
+
+        aligned.append(AlignedSegment(
+            index           = m.index,
+            original_start  = m.source_start,
+            original_end    = m.source_end,
+            scheduled_start = sched_start,
+            scheduled_end   = sched_end,
+            text            = m.translated_text,
+            action          = action,
+            gap_shift_s     = gap_shift_s,
+            stretch_factor  = stretch_factor,
+        ))
+
+        cumulative_drift += gap_shift_s
+
+    return aligned
+
+def compare_alignments(
+    greedy: list[AlignedSegment],
+    dp:     list[AlignedSegment],
+) -> dict:
+    def _stats(segs: list[AlignedSegment]) -> dict:
+        total_drift    = sum(s.gap_shift_s for s in segs)
+        severe_stretch = sum(1 for s in segs if s.stretch_factor > 1.4)
+        overlaps       = sum(
+            1 for a, b in zip(segs, segs[1:])
+            if a.scheduled_end > b.scheduled_start + 0.01  # 10 ms tolerance
+        )
+        req_shorter    = sum(1 for s in segs if s.action == AlignAction.REQUEST_SHORTER)
+        fails          = sum(1 for s in segs if s.action == AlignAction.FAIL)
+        return {
+            "total_drift_s":        round(total_drift, 3),
+            "severe_stretch_count": severe_stretch,
+            "overlap_count":        overlaps,
+            "request_shorter_count":req_shorter,
+            "fail_count":           fails,
+        }
+
+    return {"greedy": _stats(greedy), "dp": _stats(dp)}
