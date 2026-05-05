@@ -96,11 +96,8 @@ async def diarize_endpoint(video_id: str):
     transcript_path = settings.transcriptions_dir / f"{title}.json"
     if transcript_path.exists():
         transcript = json.loads(transcript_path.read_text())
-        labeled_segments = assign_speakers(
-            transcript,
-            diar_segments
-        )
-        transcript = {"segments": labeled_segments}
+        labeled_segments = assign_speakers(transcript.get("segments", []), diar_segments)
+        transcript["segments"] = labeled_segments
         transcript_path.write_text(json.dumps(transcript))
 
     
