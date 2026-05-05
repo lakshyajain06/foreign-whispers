@@ -1,3 +1,6 @@
+Joshua Woo jjw9119@nyu.edu
+Lakshya Jain lj2515@nyu.edu
+
 # Foreign Whispers
 
 [![License: AGPL-3.0 + Commons Clause](https://img.shields.io/badge/License-Source_Available-blue.svg)](./LICENSE)
